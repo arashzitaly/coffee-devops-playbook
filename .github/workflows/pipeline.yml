@@ -4,7 +4,7 @@ on:
     push:
         branches: ["**"]
     pull_request:
-        branches: ["develop"]
+        branches: ["develop", "main"]
 
 permissions:
     contents: read
@@ -42,6 +42,7 @@ jobs:
         name: Build & Push Image (GHCR)
         runs-on: ubuntu-latest
         needs: [ci]
+        # Enforced: only develop/release/*/main can build & push
         if: >
             github.event_name == 'push' &&
             (github.ref_name == 'develop' || startsWith(github.ref_name, 'release/') || github.ref_name == 'main')
@@ -88,9 +89,69 @@ jobs:
                   docker build -t "${{ steps.meta.outputs.image }}" .
                   docker push "${{ steps.meta.outputs.image }}"
 
-    deploy:
-        name: Deploy to Kubernetes
+    deploy_dev:
+        name: Deploy to K8s (dev)
         runs-on: ubuntu-latest
         needs: [build_push]
-        if: github.event_name == 'push' && (github.ref_name == 'develop' || github.ref_name == 'main')
-        environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+        if: github.event_name == 'push' && github.ref_name == 'develop'
+        environment: dev
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up kubectl
+              uses: azure/setup-kubectl@v4
+              with:
+                  version: "v1.29.0"
+
+            - name: Configure kubeconfig
+              shell: bash
+              run: |
+                  mkdir -p ~/.kube
+                  echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+                  chmod 600 ~/.kube/config
+                  kubectl get ns
+
+            - name: Deploy manifests + set image + rollout
+              shell: bash
+              run: |
+                  NS="dev"
+                  IMAGE="${{ needs.build_push.outputs.image }}"
+
+                  kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+                  kubectl -n "$NS" apply -f k8s/
+                  kubectl -n "$NS" set image deployment/coffee-app coffee-app="$IMAGE"
+                  kubectl -n "$NS" rollout status deployment/coffee-app
+
+    deploy_prod:
+        name: Deploy to K8s (prod)
+        runs-on: ubuntu-latest
+        needs: [build_push]
+        if: github.event_name == 'push' && github.ref_name == 'main'
+        # IMPORTANT: configure Environment "prod" in GitHub with required reviewers for manual approval
+        environment: prod
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up kubectl
+              uses: azure/setup-kubectl@v4
+              with:
+                  version: "v1.29.0"
+
+            - name: Configure kubeconfig
+              shell: bash
+              run: |
+                  mkdir -p ~/.kube
+                  echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
+                  chmod 600 ~/.kube/config
+                  kubectl get ns
+
+            - name: Deploy manifests + set image + rollout
+              shell: bash
+              run: |
+                  NS="prod"
+                  IMAGE="${{ needs.build_push.outputs.image }}"
+
+                  kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+                  kubectl -n "$NS" apply -f k8s/
+                  kubectl -n "$NS" set image deployment/coffee-app coffee-app="$IMAGE"
+                  kubectl -n "$NS" rollout status deployment/coffee-app
