@@ -1,157 +1,121 @@
-name: coffee-ci-cd
+name: coffee-ci
 
 on:
-    push:
-        branches: ["**"]
-    pull_request:
-        branches: ["develop", "main"]
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["develop", "main"]
 
 permissions:
-    contents: read
-    packages: write
+  contents: read
+  packages: write
 
 env:
-    REGISTRY: ghcr.io
-    IMAGE_NAME: coffee-app
-    PYTHON_VERSION: "3.11"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: coffee-app
+  PYTHON_VERSION: "3.11"
 
 jobs:
-    ci:
-        name: CI (ruff + pytest)
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@v4
+  ci:
+    name: CI (install + health + lint + test)
+    runs-on: ubuntu-latest
 
-            - name: Set up Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: ${{ env.PYTHON_VERSION }}
+    steps:
+      - uses: actions/checkout@v4
 
-            - name: Install deps
-              run: |
-                  python -m pip install --upgrade pip
-                  pip install -r requirements.txt
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
-            - name: Lint (ruff)
-              run: ruff check .
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-            - name: Unit tests (pytest)
-              run: pytest -q
+      # Optional but useful: fail fast if app can't boot and serve /health
+      - name: Health check (start app and curl /health)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m flask --version || true
 
-    build_push:
-        name: Build & Push Image (GHCR)
-        runs-on: ubuntu-latest
-        needs: [ci]
-        # Enforced: only develop/release/*/main can build & push
-        if: >
-            github.event_name == 'push' &&
-            (github.ref_name == 'develop' || startsWith(github.ref_name, 'release/') || github.ref_name == 'main')
-        outputs:
-            image: ${{ steps.meta.outputs.image }}
-            tag: ${{ steps.meta.outputs.tag }}
-        steps:
-            - uses: actions/checkout@v4
+          # Start app (adjust if you use a different entrypoint)
+          # Requires your app to expose /health and bind to 127.0.0.1:5000 by default
+          python -m flask run --host 127.0.0.1 --port 5000 &
+          PID=$!
 
-            - name: Compute image tag
-              id: meta
-              shell: bash
-              run: |
-                  SHORTSHA="${GITHUB_SHA::7}"
-                  BRANCH="${GITHUB_REF_NAME}"
+          # Wait up to ~15s for readiness
+          for i in {1..15}; do
+            if curl -fsS http://127.0.0.1:5000/health >/dev/null; then
+              echo "Health OK"
+              kill $PID
+              wait $PID || true
+              exit 0
+            fi
+            sleep 1
+          done
 
-                  if [ "$BRANCH" = "develop" ]; then
-                    TAG="dev-$SHORTSHA"
-                  elif [[ "$BRANCH" == release/* ]]; then
-                    VER="${BRANCH#release/}"
-                    TAG="rc-$VER-${GITHUB_RUN_NUMBER}"
-                  elif [ "$BRANCH" = "main" ]; then
-                    TAG="sha-$SHORTSHA"
-                  else
-                    TAG="noop"
-                  fi
+          echo "Health FAILED"
+          kill $PID
+          wait $PID || true
+          exit 1
 
-                  OWNER_LC=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
-                  IMAGE="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.IMAGE_NAME }}:${TAG}"
+      - name: Lint (ruff)
+        run: ruff check .
 
-                  echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-                  echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Unit tests (pytest)
+        run: pytest -q
 
-            - name: Log in to GHCR
-              uses: docker/login-action@v3
-              with:
-                  registry: ${{ env.REGISTRY }}
-                  username: ${{ github.actor }}
-                  password: ${{ secrets.GITHUB_TOKEN }}
+  build_push:
+    name: Build & Push Image (GHCR)
+    runs-on: ubuntu-latest
+    needs: [ci]
+    # only develop/release/*/main can build & push
+    if: >
+      github.event_name == 'push' &&
+      (github.ref_name == 'develop' || startsWith(github.ref_name, 'release/') || github.ref_name == 'main')
 
-            - name: Build and push
-              shell: bash
-              run: |
-                  docker build -t "${{ steps.meta.outputs.image }}" .
-                  docker push "${{ steps.meta.outputs.image }}"
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
 
-    deploy_dev:
-        name: Deploy to K8s (dev)
-        runs-on: ubuntu-latest
-        needs: [build_push]
-        if: github.event_name == 'push' && github.ref_name == 'develop'
-        environment: dev
-        steps:
-            - uses: actions/checkout@v4
+    steps:
+      - uses: actions/checkout@v4
 
-            - name: Set up kubectl
-              uses: azure/setup-kubectl@v4
-              with:
-                  version: "v1.29.0"
+      - name: Compute image tag
+        id: meta
+        shell: bash
+        run: |
+          SHORTSHA="${GITHUB_SHA::7}"
+          BRANCH="${GITHUB_REF_NAME}"
 
-            - name: Configure kubeconfig
-              shell: bash
-              run: |
-                  mkdir -p ~/.kube
-                  echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
-                  chmod 600 ~/.kube/config
-                  kubectl get ns
+          if [ "$BRANCH" = "develop" ]; then
+            TAG="dev-$SHORTSHA"
+          elif [[ "$BRANCH" == release/* ]]; then
+            VER="${BRANCH#release/}"
+            TAG="rc-$VER-${GITHUB_RUN_NUMBER}"
+          elif [ "$BRANCH" = "main" ]; then
+            TAG="sha-$SHORTSHA"
+          else
+            TAG="noop"
+          fi
 
-            - name: Deploy manifests + set image + rollout
-              shell: bash
-              run: |
-                  NS="dev"
-                  IMAGE="${{ needs.build_push.outputs.image }}"
+          OWNER_LC=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.IMAGE_NAME }}:${TAG}"
 
-                  kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-                  kubectl -n "$NS" apply -f k8s/
-                  kubectl -n "$NS" set image deployment/coffee-app coffee-app="$IMAGE"
-                  kubectl -n "$NS" rollout status deployment/coffee-app
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-    deploy_prod:
-        name: Deploy to K8s (prod)
-        runs-on: ubuntu-latest
-        needs: [build_push]
-        if: github.event_name == 'push' && github.ref_name == 'main'
-        # IMPORTANT: configure Environment "prod" in GitHub with required reviewers for manual approval
-        environment: prod
-        steps:
-            - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Set up kubectl
-              uses: azure/setup-kubectl@v4
-              with:
-                  version: "v1.29.0"
-
-            - name: Configure kubeconfig
-              shell: bash
-              run: |
-                  mkdir -p ~/.kube
-                  echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > ~/.kube/config
-                  chmod 600 ~/.kube/config
-                  kubectl get ns
-
-            - name: Deploy manifests + set image + rollout
-              shell: bash
-              run: |
-                  NS="prod"
-                  IMAGE="${{ needs.build_push.outputs.image }}"
-
-                  kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-                  kubectl -n "$NS" apply -f k8s/
-                  kubectl -n "$NS" set image deployment/coffee-app coffee-app="$IMAGE"
-                  kubectl -n "$NS" rollout status deployment/coffee-app
+      - name: Build and push
+        shell: bash
+        run: |
+          docker build -t "${{ steps.meta.outputs.image }}" .
+          docker push "${{ steps.meta.outputs.image }}"
